@@ -147,14 +147,14 @@ PRODUCT_PACKAGES += \
     LineageSetupWizard \
     ExactCalculator \
     LockClock \
-    TrebuchetQuickStep \
     Updater \
     WallpaperPicker \
     WeatherProvider
 
 # Custom SomeFeaK OS packages
 PRODUCT_PACKAGES += \
-    SnapdragonGallery
+    SnapdragonGallery \
+    Launcher3QuickStep
 
 # Berry styles
 PRODUCT_PACKAGES += \
