@@ -17,8 +17,10 @@
 
 PRODUCT_COPY_FILES_LIST=()
 PRODUCT_COPY_FILES_HASHES=()
+PRODUCT_COPY_FILES_FIXUP_HASHES=()
 PRODUCT_PACKAGES_LIST=()
 PRODUCT_PACKAGES_HASHES=()
+PRODUCT_PACKAGES_FIXUP_HASHES=()
 PACKAGE_LIST=()
 VENDOR_STATE=-1
 VENDOR_RADIO_STATE=-1
@@ -659,9 +661,14 @@ function parse_file_list() {
         exit 1
     fi
 
-    if [ $# -eq 2 ]; then
+    if [ -n "$2" ]; then
+        echo "Using section \"$2\""
         LIST=$TMPDIR/files.txt
-        cat $1 | sed -n '/# '"$2"'/I,/^\s*$/p' > $LIST
+        # Match all lines starting with first line found to start* with '#'
+        # comment and contain** $2, and ending with first line to be empty*.
+        # *whitespaces (tabs, spaces) at the beginning of lines are discarded
+        # **the $2 match is case-insensitive
+        cat $1 | sed -n '/^[[:space:]]*#.*'"$2"'/I,/^[[:space:]]*$/ p' > $LIST
     else
         LIST=$1
     fi
@@ -669,8 +676,10 @@ function parse_file_list() {
 
     PRODUCT_PACKAGES_LIST=()
     PRODUCT_PACKAGES_HASHES=()
+    PRODUCT_PACKAGES_FIXUP_HASHES=()
     PRODUCT_COPY_FILES_LIST=()
     PRODUCT_COPY_FILES_HASHES=()
+    PRODUCT_COPY_FILES_FIXUP_HASHES=()
 
     while read -r line; do
         if [ -z "$line" ]; then continue; fi
@@ -682,17 +691,23 @@ function parse_file_list() {
         local COUNT=${#SPLIT[@]}
         local SPEC=${SPLIT[0]}
         local HASH="x"
+        local FIXUP_HASH="x"
         if [ "$COUNT" -gt "1" ]; then
             HASH=${SPLIT[1]}
+        fi
+        if [ "$COUNT" -gt "2" ]; then
+            FIXUP_HASH=${SPLIT[2]}
         fi
 
         # if line starts with a dash, it needs to be packaged
         if [[ "$SPEC" =~ ^- ]]; then
             PRODUCT_PACKAGES_LIST+=("${SPEC#-}")
             PRODUCT_PACKAGES_HASHES+=("$HASH")
+            PRODUCT_PACKAGES_FIXUP_HASHES+=("$FIXUP_HASH")
         else
             PRODUCT_COPY_FILES_LIST+=("$SPEC")
             PRODUCT_COPY_FILES_HASHES+=("$HASH")
+            PRODUCT_COPY_FILES_FIXUP_HASHES+=("$FIXUP_HASH")
         fi
 
     done < <(egrep -v '(^#|^[[:space:]]*$)' "$LIST" | LC_ALL=C sort | uniq)
@@ -756,6 +771,7 @@ function get_file() {
         # try to copy
         cp -r "$SRC/$1"           "$2" 2>/dev/null && return 0
         cp -r "$SRC/${1#/system}" "$2" 2>/dev/null && return 0
+        cp -r "$SRC/system/$1"    "$2" 2>/dev/null && return 0
 
         return 1
     fi
@@ -911,32 +927,122 @@ function fix_xml() {
     mv "$TEMP_XML" "$XML"
 }
 
+function get_hash() {
+    local FILE="$1"
+
+    if [ "$(uname)" == "Darwin" ]; then
+        shasum "${FILE}" | awk '{print $1}'
+    else
+        sha1sum "${FILE}" | awk '{print $1}'
+    fi
+}
+
+function print_spec() {
+    local SPEC_PRODUCT_PACKAGE="$1"
+    local SPEC_SRC_FILE="$2"
+    local SPEC_DST_FILE="$3"
+    local SPEC_ARGS="$4"
+    local SPEC_HASH="$5"
+    local SPEC_FIXUP_HASH="$6"
+
+    local PRODUCT_PACKAGE=""
+    if [ ${SPEC_PRODUCT_PACKAGE} = true ]; then
+        PRODUCT_PACKAGE="-"
+    fi
+    local SRC=""
+    if [ ! -z "${SPEC_SRC_FILE}" ] && [ "${SPEC_SRC_FILE}" != "${SPEC_DST_FILE}" ]; then
+        SRC="${SPEC_SRC_FILE}:"
+    fi
+    local DST=""
+    if [ ! -z "${SPEC_DST_FILE}" ]; then
+        DST="${SPEC_DST_FILE}"
+    fi
+    local ARGS=""
+    if [ ! -z "${SPEC_ARGS}" ]; then
+        ARGS=";${SPEC_ARGS}"
+    fi
+    local HASH=""
+    if [ ! -z "${SPEC_HASH}" ] && [ "${SPEC_HASH}" != "x" ]; then
+        HASH="|${SPEC_HASH}"
+    fi
+    local FIXUP_HASH=""
+    if [ ! -z "${SPEC_FIXUP_HASH}" ] && [ "${SPEC_FIXUP_HASH}" != "x" ] && [ "${SPEC_FIXUP_HASH}" != "${SPEC_HASH}" ]; then
+        FIXUP_HASH="|${SPEC_FIXUP_HASH}"
+    fi
+    printf '%s%s%s%s%s%s\n' "${PRODUCT_PACKAGE}" "${SRC}" "${DST}" "${ARGS}" "${HASH}" "${FIXUP_HASH}"
+}
+
+# To be overridden by device-level extract-files.sh
+# Parameters:
+#   $1: spec name of a blob. Can be used for filtering.
+#       If the spec is "src:dest", then $1 is "dest".
+#       If the spec is "src", then $1 is "src".
+#   $2: path to blob file. Can be used for fixups.
+#
+function blob_fixup() {
+    :
+}
+
 #
 # extract:
 #
-# $1: file containing the list of items to extract
+# Positional parameters:
+# $1: file containing the list of items to extract (aka proprietary-files.txt)
 # $2: path to extracted system folder, an ota zip file, or "adb" to extract from device
-# $3: section in list file to extract - optional
+# $3: section in list file to extract - optional. Setting section via $3 is deprecated.
+#
+# Non-positional parameters (coming after $2):
+# --section: preferred way of selecting the portion to parse and extract from
+#            proprietary-files.txt
+# --kang: if present, this option will activate the printing of hashes for the
+#         extracted blobs. Useful with --section for subsequent pinning of
+#         blobs taken from other origins.
 #
 function extract() {
+    # Consume positional parameters
+    local PROPRIETARY_FILES_TXT="$1"; shift
+    local SRC="$1"; shift
+    local SECTION=""
+    local KANG=false
+
+    # Consume optional, non-positional parameters
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+        -s|--section)
+            SECTION="$2"; shift
+            ;;
+        -k|--kang)
+            KANG=true
+            DISABLE_PINNING=1
+            ;;
+        *)
+            # Backwards-compatibility with the old behavior, where $3, if
+            # present, denoted an optional positional ${SECTION} argument.
+            # Users of ${SECTION} are encouraged to migrate from setting it as
+            # positional $3, to non-positional --section ${SECTION}, the
+            # reason being that it doesn't scale to have more than 1 optional
+            # positional argument.
+            SECTION="$1"
+            ;;
+        esac
+        shift
+    done
+
     if [ -z "$OUTDIR" ]; then
         echo "Output dir not set!"
         exit 1
     fi
 
-    if [ -z "$3" ]; then
-        parse_file_list "$1"
-    else
-        parse_file_list "$1" "$3"
-    fi
+    parse_file_list "${PROPRIETARY_FILES_TXT}" "${SECTION}"
 
     # Allow failing, so we can try $DEST and/or $FILE
     set +e
 
     local FILELIST=( ${PRODUCT_COPY_FILES_LIST[@]} ${PRODUCT_PACKAGES_LIST[@]} )
     local HASHLIST=( ${PRODUCT_COPY_FILES_HASHES[@]} ${PRODUCT_PACKAGES_HASHES[@]} )
+    local FIXUP_HASHLIST=( ${PRODUCT_COPY_FILES_FIXUP_HASHES[@]} ${PRODUCT_PACKAGES_FIXUP_HASHES[@]} )
+    local PRODUCT_COPY_FILES_COUNT=${#PRODUCT_COPY_FILES_LIST[@]}
     local COUNT=${#FILELIST[@]}
-    local SRC="$2"
     local OUTPUT_ROOT="$LINEAGE_ROOT"/"$OUTDIR"/proprietary
     local OUTPUT_TMP="$TMPDIR"/"$OUTDIR"/proprietary
 
@@ -989,7 +1095,7 @@ function extract() {
         VENDOR_STATE=1
     fi
 
-    echo "Extracting $COUNT files in $1 from $SRC:"
+    echo "Extracting ${COUNT} files in ${PROPRIETARY_FILES_TXT} from ${SRC}:"
 
     for (( i=1; i<COUNT+1; i++ )); do
 
@@ -1000,6 +1106,13 @@ function extract() {
         local TMP_DIR=
         local SRC_FILE=
         local DST_FILE=
+        local IS_PRODUCT_PACKAGE=false
+
+        # Note: this relies on the fact that the ${FILELIST[@]} array
+        # contains first ${PRODUCT_COPY_FILES_LIST[@]}, then ${PRODUCT_PACKAGES_LIST[@]}.
+        if [ "${i}" -gt "${PRODUCT_COPY_FILES_COUNT}" ]; then
+            IS_PRODUCT_PACKAGE=true
+        fi
 
         if [ "${SPEC_ARGS}" = "rootfs" ]; then
             OUTPUT_DIR="${OUTPUT_ROOT}/rootfs"
@@ -1013,32 +1126,24 @@ function extract() {
             DST_FILE="/system/${SPEC_DST_FILE}"
         fi
 
-        if [ "$SRC" = "adb" ]; then
-            printf '  - %s .. \n' "${DST_FILE}"
-        else
-            printf '  - %s \n' "${DST_FILE}"
-        fi
-
         # Strip the file path in the vendor repo of "system", if present
         local VENDOR_REPO_FILE="$OUTPUT_DIR/${DST_FILE#/system}"
+        local BLOB_DISPLAY_NAME="${DST_FILE#/system/}"
         mkdir -p $(dirname "${VENDOR_REPO_FILE}")
 
         # Check pinned files
         local HASH="$(echo ${HASHLIST[$i-1]} | awk '{ print tolower($0); }')"
+        local FIXUP_HASH="$(echo ${FIXUP_HASHLIST[$i-1]} | awk '{ print tolower($0); }')"
         local KEEP=""
-        if [ "$DISABLE_PINNING" != "1" ] && [ ! -z "$HASH" ] && [ "$HASH" != "x" ]; then
+        if [ "$DISABLE_PINNING" != "1" ] && [ "$HASH" != "x" ]; then
             if [ -f "${VENDOR_REPO_FILE}" ]; then
                 local PINNED="${VENDOR_REPO_FILE}"
             else
                 local PINNED="${TMP_DIR}${DST_FILE#/system}"
             fi
             if [ -f "$PINNED" ]; then
-                if [ "$(uname)" == "Darwin" ]; then
-                    local TMP_HASH=$(shasum "$PINNED" | awk '{print $1}' )
-                else
-                    local TMP_HASH=$(sha1sum "$PINNED" | awk '{print $1}' )
-                fi
-                if [ "$TMP_HASH" = "$HASH" ]; then
+                local TMP_HASH=$(get_hash "${PINNED}")
+                if [ "${TMP_HASH}" = "${HASH}" ] || [ "${TMP_HASH}" = "${FIXUP_HASH}" ]; then
                     KEEP="1"
                     if [ ! -f "${VENDOR_REPO_FILE}" ]; then
                         cp -p "$PINNED" "${VENDOR_REPO_FILE}"
@@ -1047,8 +1152,12 @@ function extract() {
             fi
         fi
 
+        if [ "${KANG}" = false ]; then
+            printf '  - %s\n' "${BLOB_DISPLAY_NAME}"
+        fi
+
         if [ "$KEEP" = "1" ]; then
-            printf '    + (keeping pinned file with hash %s)\n' "$HASH"
+            printf '    + keeping pinned file with hash %s\n' "${HASH}"
         else
             FOUND=false
             # Try Lineage target first.
@@ -1063,24 +1172,28 @@ function extract() {
             done
 
             if [ "${FOUND}" = false ]; then
-                printf '    !! file not found in source\n'
+                printf '    !! %s: file not found in source\n' "${BLOB_DISPLAY_NAME}"
                 continue
             fi
         fi
 
-        if [ "$?" == "0" ]; then
-            # Deodex apk|jar if that's the case
-            if [[ "$FULLY_DEODEXED" -ne "1" && "${VENDOR_REPO_FILE}" =~ .(apk|jar)$ ]]; then
-                oat2dex "${VENDOR_REPO_FILE}" "${SRC_FILE}" "$SRC"
-                if [ -f "$TMPDIR/classes.dex" ]; then
-                    zip -gjq "${VENDOR_REPO_FILE}" "$TMPDIR/classes.dex"
-                    rm "$TMPDIR/classes.dex"
-                    printf '    (updated %s from odex files)\n' "${SRC_FILE}"
-                fi
-            elif [[ "${VENDOR_REPO_FILE}" =~ .xml$ ]]; then
-                fix_xml "${VENDOR_REPO_FILE}"
+        # Blob fixup pipeline has 2 parts: one that is fixed and
+        # one that is user-configurable
+        local PRE_FIXUP_HASH=$(get_hash ${VENDOR_REPO_FILE})
+        # Deodex apk|jar if that's the case
+        if [[ "$FULLY_DEODEXED" -ne "1" && "${VENDOR_REPO_FILE}" =~ .(apk|jar)$ ]]; then
+            oat2dex "${VENDOR_REPO_FILE}" "${SRC_FILE}" "$SRC"
+            if [ -f "$TMPDIR/classes.dex" ]; then
+                zip -gjq "${VENDOR_REPO_FILE}" "$TMPDIR/classes.dex"
+                rm "$TMPDIR/classes.dex"
+                printf '    (updated %s from odex files)\n' "${SRC_FILE}"
             fi
+        elif [[ "${VENDOR_REPO_FILE}" =~ .xml$ ]]; then
+            fix_xml "${VENDOR_REPO_FILE}"
         fi
+        # Now run user-supplied fixup function
+        blob_fixup "${BLOB_DISPLAY_NAME}" "${VENDOR_REPO_FILE}"
+        local POST_FIXUP_HASH=$(get_hash ${VENDOR_REPO_FILE})
 
         if [ -f "${VENDOR_REPO_FILE}" ]; then
             local DIR=$(dirname "${VENDOR_REPO_FILE}")
@@ -1089,6 +1202,22 @@ function extract() {
                 chmod 755 "${VENDOR_REPO_FILE}"
             else
                 chmod 644 "${VENDOR_REPO_FILE}"
+            fi
+        fi
+
+        if [ "${KANG}" =  true ]; then
+            print_spec "${IS_PRODUCT_PACKAGE}" "${SPEC_SRC_FILE}" "${SPEC_DST_FILE}" "${SPEC_ARGS}" "${PRE_FIXUP_HASH}" "${POST_FIXUP_HASH}"
+        fi
+
+        # Check and print whether the fixup pipeline actually did anything.
+        # This isn't done right after the fixup pipeline because we want this print
+        # to come after print_spec above, when in kang mode.
+        if [ "${PRE_FIXUP_HASH}" != "${POST_FIXUP_HASH}" ]; then
+            printf "    + Fixed up %s\n" "${BLOB_DISPLAY_NAME}"
+            # Now sanity-check the spec for this blob.
+            if [ "${KANG}" = false ] && [ "${FIXUP_HASH}" = "x" ] && [ "${HASH}" != "x" ]; then
+                printf "WARNING: The %s file was fixed up, but it is pinned.\n" ${BLOB_DISPLAY_NAME}
+                printf "This is a mistake and you want to either remove the hash completely, or add an extra one.\n"
             fi
         fi
 
